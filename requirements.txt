@@ -1,0 +1,4 @@
+spacy>=3.8
+num2words>=0.5
+PyQt5>=5.15
+requests>=2.28
