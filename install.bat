@@ -6,15 +6,12 @@ cd /d "%~dp0"
 echo Creating virtual environment...
 python -m venv venv
 
-echo Activating virtual environment...
-call venv\Scripts\activate
-
 echo Installing dependencies...
-python -m pip install --upgrade pip
-pip install -r requirements.txt
+venv\Scripts\python.exe -m pip install --upgrade pip
+venv\Scripts\python.exe -m pip install -r requirements.txt
 
 echo Downloading spaCy model...
-python -m spacy download en_core_web_md
+venv\Scripts\python.exe -m spacy download en_core_web_md
 
 echo.
 echo ============================================

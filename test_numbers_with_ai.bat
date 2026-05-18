@@ -19,7 +19,12 @@ if not exist "%INPUT_FILE%" (
 )
 
 cd /d "%~dp0"
-call venv\Scripts\activate
+
+if not exist "venv\Scripts\python.exe" (
+    echo Error: venv not found. Please run install.bat first.
+    pause
+    exit /b 1
+)
 
 echo.
 echo === Number Processing AI Mode ===
@@ -41,5 +46,5 @@ if "%CHOICE%"=="1" (
     exit /b 1
 )
 
-python process_numbers.py "%INPUT_FILE%" --review --ai-mode %AI_MODE%
+venv\Scripts\python.exe process_numbers.py "%INPUT_FILE%" --review --ai-mode %AI_MODE%
 pause
