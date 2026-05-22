@@ -146,60 +146,13 @@ class RulesOnlyNumberProcessor:
                         number_type = matcher_type
                         rule_source = "spacy_matcher"
                     else:
-                        # Try NER classification
-                        ner_type = self._ner_classify(line_content, start, end)
+                        # Try dependency parse classification
+                        dep_type = self._dep_classify(line_content, start, end, number)
 
-                        if ner_type:
-                            number_type = ner_type
-                            rule_source = "spacy_ner"
-                            # FIX 1 & 2: NER currency guard — check all currency symbols, not just $
-                            if number_type == "currency" and not re.match(r"[\$£€¥₹¢]", number):
-                                currency_symbols = "$£€¥₹¢"
-                                found_sym = next((s for s in currency_symbols if s in ctx_before[-5:]), None)
-                                if found_sym:
-                                    number = found_sym + number
-                                else:
-                                    # No currency symbol found — NER was wrong, use as general_number
-                                    number_type = "general_number"
-                                    rule_source = "ner_currency_fallback"
-                            # FIX 5 & 6: Year plausibility guard — NER DATE must be 4-digit year in valid range
-                            # FIX 6: Check for hyphen-prefix alphanumeric identifier (QF-74843)
-                            elif number_type == "year":
-                                # FIX 1: Check if it's actually a clock time (9:38, 14.30) first
-                                if re.match(r'^\d{1,2}[:.]\d{2}$', number):
-                                    number_type = "clock_time"
-                                    rule_source = "ner_date_to_time"
-                                else:
-                                    try:
-                                        year_val = int(number.replace(",", ""))
-                                        if not (1000 <= year_val <= 2150) or len(number.replace(",", "")) != 4:
-                                            # FIX 5: Check for ZIP code (5-digit after 2-letter state abbr: FL 33731)
-                                            if re.search(r'\b[A-Z]{2}\s*$', ctx_before) and re.match(r'^\d{5}$', number):
-                                                number_type = "identifier"
-                                                rule_source = "rule_zip_code"
-                                            # FIX 6: Check if preceded by hyphenated code prefix
-                                            elif ctx_before.rstrip().endswith("-"):
-                                                number_type = "identifier"
-                                                rule_source = "ner_year_hyphen_id"
-                                            else:
-                                                number_type = "general_number"
-                                                rule_source = "ner_year_fallback"
-                                    except ValueError:
-                                        number_type = "general_number"
-                                        rule_source = "ner_year_fallback"
-                            # FIX 4: After NER downgrade, check for street address pattern (387 Obsidian Road)
-                            if number_type == "general_number" and rule_source in ("ner_currency_fallback", "ner_year_fallback"):
-                                # FIX 1: Don't reclassify clock-like numbers (9:38, 14.30) as street addresses
-                                if not re.match(r'^\d{1,2}[:.]\d{2}$', number):
-                                    street_suffixes = {
-                                        "street", "road", "avenue", "ave", "lane", "drive", "boulevard",
-                                        "blvd", "court", "place", "way", "close", "terrace", "row", "crescent"
-                                    }
-                                    if any(re.search(r'\b' + w + r'\b', ctx_after, re.I) for w in street_suffixes):
-                                        number_type = "identifier"
-                                        rule_source = "rule_street_address_post_ner"
+                        if dep_type:
+                            number_type, rule_source = dep_type
                         else:
-                            # Try prefix rules for CARDINAL
+                            # Try keyword/format rules for CARDINAL
                             cardinal_type = self._classify_cardinal(number, ctx_before, ctx_after)
                             if cardinal_type:
                                 number_type, rule_source = cardinal_type
@@ -213,12 +166,24 @@ class RulesOnlyNumberProcessor:
                 if number_type in ("range_currency", "range_measurement"):
                     formatted = self._format_compound(number, number_type)
                 elif number_type == "clock_time":
-                    # FIX 4: Check for "hours" suffix to detect military time format
-                    is_military = bool(re.search(r'\bhours?\b', ctx_after, re.I))
-                    formatted = self._try_format_clock_time(number, military=is_military)
-                    if formatted is None:
+                    # Elapsed duration ("3.18 minutes ago") is not a clock reading
+                    _after_words = ctx_after.strip().lower().split()
+                    _elapsed_units = {"minutes", "minute", "seconds", "second", "hours", "hour",
+                                      "days", "day", "weeks", "week", "months", "month"}
+                    _elapsed_followers = {"ago", "earlier", "before", "prior", "later"}
+                    _is_elapsed = (len(_after_words) >= 2
+                                   and _after_words[0] in _elapsed_units
+                                   and _after_words[1] in _elapsed_followers)
+                    if _is_elapsed:
                         formatted = self.processor._format_number_by_type(number, "general_number")
                         number_type = "general_number"
+                    else:
+                        # FIX 4: Check for "hours" suffix to detect military time format
+                        is_military = bool(re.search(r'\bhours?\b', ctx_after, re.I))
+                        formatted = self._try_format_clock_time(number, military=is_military)
+                        if formatted is None:
+                            formatted = self.processor._format_number_by_type(number, "general_number")
+                            number_type = "general_number"
                 elif number_type == "identifier" and compound_type:
                     # Compound identifier
                     formatted = self._format_compound(number, number_type)
@@ -522,11 +487,164 @@ class RulesOnlyNumberProcessor:
             pass  # Fall through to rules if NER fails
         return None
 
+    def _dep_classify(self, line: str, start: int, end: int, number: str) -> Optional[Tuple[str, str]]:
+        """
+        Classify number using spaCy dependency parse tree structure.
+
+        Returns (type, rule_source) or None if no structural pattern matches.
+        """
+        try:
+            doc = self.nlp(line)
+
+            # Find the token at our number's character span
+            number_tok = None
+            for tok in doc:
+                if tok.idx <= start < tok.idx + len(tok.text):
+                    number_tok = tok
+                    break
+            if number_tok is None:
+                return None
+
+            # Pattern 1: number governed by preposition "at"
+            # Case A: number is directly pobj of "at"
+            # Case B: number is a modifier (nummod, amod, compound) of a noun that is pobj of "at"
+
+            # Check if number is a modifier of something (Case B)
+            if number_tok.dep_ in ("nummod", "amod", "compound"):
+                noun = number_tok.head  # The noun the number modifies
+                prep = noun.head        # The preposition governing the noun
+                if prep.dep_ == "prep" and prep.lower_ == "at":
+                    verb = prep.head
+                    if verb.pos_ in ("VERB", "AUX"):
+                        time_verbs = {
+                            "meet", "arrive", "leave", "depart", "start", "begin",
+                            "open", "close", "schedule", "report", "be"
+                        }
+                        measurement_verbs = {
+                            "set", "turn", "adjust", "calibrate", "tune",
+                            "dial", "position", "place", "configure"
+                        }
+                        lemma = verb.lemma_.lower()
+                        if lemma in time_verbs:
+                            return ("clock_time", "dep_at_time_verb")
+                        elif lemma in measurement_verbs:
+                            return ("general_number", "dep_at_measurement_verb")
+                    # "at" present but no matching verb — default to time
+                    return ("clock_time", "dep_at_default")
+
+            # Check if number is directly a pobj of "at" (Case A)
+            head = number_tok.head
+            if head.dep_ == "prep" and head.lower_ == "at":
+                verb = head.head
+                if verb.pos_ in ("VERB", "AUX"):
+                    time_verbs = {
+                        "meet", "arrive", "leave", "depart", "start", "begin",
+                        "open", "close", "schedule", "report", "be"
+                    }
+                    measurement_verbs = {
+                        "set", "turn", "adjust", "calibrate", "tune",
+                        "dial", "position", "place", "configure"
+                    }
+                    lemma = verb.lemma_.lower()
+                    if lemma in time_verbs:
+                        return ("clock_time", "dep_at_time_verb")
+                    elif lemma in measurement_verbs:
+                        return ("general_number", "dep_at_measurement_verb")
+                # "at" present but no matching verb — default to time
+                return ("clock_time", "dep_at_default")
+
+            # Pattern 2: 4-digit year with month name in same sentence
+            if re.match(r'^\d{4}$', number):
+                try:
+                    if 1000 <= int(number) <= 2150:
+                        sentence_text = number_tok.sent.text
+                        if re.search(
+                            r'\b(january|february|march|april|may|june|july|august|'
+                            r'september|october|november|december)\b',
+                            sentence_text, re.I
+                        ):
+                            return ("year", "dep_month_year")
+                except ValueError:
+                    pass
+
+            # Pattern 3: temporal preposition + common era range (directly, not via nummod of a unit)
+            # "popping to 1939", "the war in 1945", "during 1066"
+            # Key: number must be directly the pobj of the preposition (not a nummod of a noun)
+            if re.match(r'^\d+$', number):
+                try:
+                    val = int(number.replace(',', ''))
+                    if 0 <= val <= 2199:
+                        head = number_tok.head
+                        if head.dep_ == "prep" and head.lower_ in {
+                            "in", "to", "of", "during", "since", "before", "after", "around", "by"
+                        }:
+                            # Guard: skip if governing verb is a measurement/setting verb
+                            # These verbs indicate the number is likely a measurement, not a year
+                            measurement_verbs = {
+                                "set", "turn", "adjust", "calibrate", "tune",
+                                "dial", "position", "place", "configure", "reach", "climb", "go"
+                            }
+                            gov = head.head
+                            if gov.pos_ in ("VERB", "AUX"):
+                                if gov.lemma_.lower() in measurement_verbs:
+                                    pass  # Skip this pattern; let keyword rules handle it
+                                else:
+                                    return ("year", "dep_temporal_prep")
+                            else:
+                                # No verb governing — noun is the root (e.g., "the war in 1945")
+                                return ("year", "dep_temporal_prep")
+                except ValueError:
+                    pass
+
+            # Pattern 4: explicit year-marker keywords — any number size
+            # "in the year 35000", "600 BC", "25th century", "anno 1066"
+            year_markers = {
+                "ad", "bc", "ce", "bce", "year", "years",
+                "century", "centuries", "decade", "decades",
+                "millennium", "millennia", "anno"
+            }
+            sentence_text = number_tok.sent.text
+            # Check ~30 chars before and after the number for year markers
+            tok_start = number_tok.idx
+            window_start = max(0, tok_start - 30)
+            window_end = min(len(sentence_text), tok_start + len(number_tok.text) + 30)
+            window = sentence_text[window_start:window_end].lower()
+            for marker in year_markers:
+                if re.search(r'\b' + marker + r'\b', window):
+                    return ("year", "dep_year_keyword")
+
+            # Pattern 5: "be" predicate — "it's 1939", "it was 1945", "this is 2001"
+            if number_tok.dep_ == "attr" and number_tok.head.lemma_ == "be":
+                if re.match(r'^\d{4}$', number):
+                    try:
+                        if 0 <= int(number) <= 2199:
+                            return ("year", "dep_be_predicate")
+                    except ValueError:
+                        pass
+
+            # Pattern 6: publication/creation verb — "Published 1939", "released 2021", "written 1945"
+            publication_verbs = {
+                "publish", "release", "write", "print", "produce",
+                "copyright", "compose", "record", "film", "broadcast", "air", "premiere"
+            }
+            head = number_tok.head
+            if head.pos_ in ("VERB", "AUX") and head.lemma_.lower() in publication_verbs:
+                if re.match(r'^\d{4}$', number):
+                    try:
+                        if 0 <= int(number) <= 2199:
+                            return ("year", "dep_publication_verb")
+                    except ValueError:
+                        pass
+
+            return None
+        except Exception:
+            return None
+
     def _classify_cardinal(
         self, number: str, ctx_before: str, ctx_after: str
     ) -> Optional[Tuple[str, str]]:
         """
-        Classify CARDINAL numbers using prefix/suffix keyword rules.
+        Classify CARDINAL numbers using domain/format keyword rules.
 
         Returns (type, rule_source) or None to fall back to full rules.
         """
@@ -536,12 +654,9 @@ class RulesOnlyNumberProcessor:
         after_words = ctx_after.strip().split()
         first_word = after_words[0].lower() if after_words else ""
 
-        # Clock time pattern: 3.30, 14.45, 6:05, etc. (before rules to catch these early)
-        if re.match(r"^\d{1,2}[.:]\d{2}$", number):
-            # Check context suggests time (before, after, at, etc.)
-            time_keywords = {"before", "after", "at", "around", "by", "until", "till", "from", "the", "was", "is"}
-            if last_word in time_keywords or re.search(r"(arrive|depart|take off|meeting|appointment|clock|time)\b", ctx_before + ctx_after, re.I):
-                return ("clock_time", "rule_clock_time")
+        # Copyright symbol immediately before the number — always year
+        if "©" in ctx_before[-10:]:
+            return ("year", "rule_copyright")
 
         # Dash-preceded number (WF-075, QF-123) — always identifier
         if ctx_before.rstrip().endswith("-"):

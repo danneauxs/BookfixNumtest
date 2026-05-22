@@ -307,7 +307,13 @@ class NumberReviewWindow(QDialog):
         fmt = QTextCharFormat()
         fmt.setBackground(QColor("#FFFF00"))
 
-        idx = sentence.find(original_num)
+        # Find the number between the » and « markers, not just the first occurrence
+        marker = f"» {original_num}"
+        marker_idx = sentence.find(marker)
+        if marker_idx != -1:
+            idx = marker_idx + len("» ")
+        else:
+            idx = sentence.find(original_num)
         if idx != -1:
             cursor.setPosition(idx)
             cursor.setPosition(idx + len(original_num), QTextCursor.KeepAnchor)
@@ -384,33 +390,38 @@ class NumberReviewWindow(QDialog):
         self.output_edit.setText(flagged_text)
 
     def apply_to_all(self):
-        """Apply current output_edit text to all proposals with matching original number."""
+        """Apply current output_edit text to all proposals with matching original number and mark them accepted."""
         current = self.proposals[self.current_index]
         original = current["original"]
         new_text = self.output_edit.text()
 
-        # Find all proposals with same original number and apply the change
         count = 0
         for p in self.proposals:
             if p["original"] == original:
                 p["user_text"] = new_text
+                p["bulk_accepted"] = True
                 count += 1
 
         if count > 1:
             print(f"Applied '{new_text}' to {count} instances of '{original}'")
 
     def accept_proposal(self):
-        """Accept the current proposal and advance."""
+        """Accept the current proposal and advance, skipping any already handled by apply_to_all."""
         p = self.proposals[self.current_index]
         p["user_text"] = self.output_edit.text()
         p["accepted"] = True
 
-        # Find next unreviewed, or enable apply button if all done
         self.current_index += 1
+        # Skip over proposals already marked accepted by apply_to_all
+        while (self.current_index < len(self.proposals)
+               and self.proposals[self.current_index].get("bulk_accepted")):
+            self.current_index += 1
+
         if self.current_index < len(self.proposals):
             self.show_proposal(self.current_index)
         else:
             self.current_index = len(self.proposals) - 1
+            self.show_proposal(self.current_index)
             self.apply_btn.setEnabled(True)
 
     def next_proposal(self):
